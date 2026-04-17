@@ -1,0 +1,8 @@
+pymap3d
+scipy
+tqdm 
+georinex 
+numpy 
+matplotlib 
+cartopy
+pandas
