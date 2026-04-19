@@ -19,8 +19,10 @@ GM = 3.986005e14
 OMEGA_E = 7.2921151467e-5 
 
 def get_tec_multiplier(sys_id):
+    # BeiDou (C) Näherungswert (B1/B2), G=GPS, E=Galileo
     if sys_id == 'G': return 9.52
     elif sys_id == 'E': return 7.76
+    elif sys_id == 'C': return 8.99 
     return 9.52
 
 def mapping_function(elevation_deg):
@@ -40,7 +42,13 @@ def calculate_ipp(lat_sta, lon_sta, azimuth_deg, elevation_deg):
 
 def get_satellite_position_kepler(nav_sv, t_obs):
     try:
+        # Erlaube nur Ephemeriden, die nicht älter als 4 Stunden sind
         nav_epoch = nav_sv.sel(time=t_obs, method='nearest')
+        t_nav = nav_epoch['time'].values
+        time_diff_hours = abs((t_obs - t_nav) / np.timedelta64(1, 'h'))
+        if time_diff_hours > 4.0:
+            return None, None, None
+
         def safe_get(*keys):
             for k in keys:
                 if k in nav_epoch.data_vars or k in nav_epoch.coords:
@@ -52,7 +60,6 @@ def get_satellite_position_kepler(nav_sv, t_obs):
         A = safe_get('sqrtA')**2
         n0 = np.sqrt(GM / A**3)
         n = n0 + safe_get('DeltaN')
-        t_nav = safe_get('time')
         tk = (t_obs - t_nav) / np.timedelta64(1, 's')
         
         M = safe_get('M0') + n * tk
@@ -80,16 +87,13 @@ def get_satellite_position_kepler(nav_sv, t_obs):
         Z = y_prime * np.sin(i)
         
         return X, Y, Z
-    except Exception as e:
-        # --- FIX D: Bessere Fehlerbehandlung ---
-        # Falls unerwartet viele Bahndaten fehlen, kann man dies hier ausgeben lassen
-        # print(f"Orbit Error für {nav_sv.sv.values} um {t_obs}: {e}")
+    except Exception:
         return None, None, None
 
 def process_rinex_advanced(obs_file, nav_files):
     obs = gr.load(obs_file)
     if isinstance(nav_files, str): nav_files = [nav_files]
-    nav_datasets = [gr.load(f) for f in nav_files]
+    nav_datasets =[gr.load(f) for f in nav_files]
     
     if 'position' not in obs.attrs:
         lat_sta, lon_sta, alt_sta = 49.87, 8.62, 100.0
@@ -97,142 +101,161 @@ def process_rinex_advanced(obs_file, nav_files):
         x, y, z = obs.attrs['position']
         lat_sta, lon_sta, alt_sta = pm.ecef2geodetic(x, y, z)
 
-    l1_bands =['C1C', 'C1P', 'C1W', 'C1X', 'C1S', 'L1C']
-    l2_bands =['C2W', 'C2C', 'C2L', 'C2I', 'C5Q', 'C7Q', 'C8Q', 'L2C', 'L5Q']
+    # Beinhaltet jetzt auch typische BeiDou Bänder (z.B. C2I, C7I)
+    l1_bands =['C1C', 'C1P', 'C1W', 'C1X', 'C1S', 'L1C', 'C2I']
+    l2_bands =['C2W', 'C2C', 'C2L', 'C5Q', 'C7Q', 'C8Q', 'L2C', 'L5Q', 'C7I']
 
-    all_lats, all_lons, all_vtecs =[], [], []
+    all_lats, all_lons, all_vtecs = [], [],[]
     valid_svs =[]
     nav_map = {} 
     
+    # Diagnose-Zähler
+    stats = {'total': 0, 'no_nav': 0, 'no_dual_freq': 0, 'low_elevation': 0, 'success': 0}
+    
     for sv in obs.sv.values:
+        stats['total'] += 1
         sys_id = str(sv)[0]
-        if sys_id in ['G', 'E']: 
+        # GLONASS (R) überspringen wir weiterhin, aber BeiDou (C) ist jetzt dabei!
+        if sys_id in ['G', 'E', 'C']: 
+            found_nav = False
             for nav_ds in nav_datasets:
                 if sv in nav_ds.sv.values:
                     valid_svs.append(sv)
                     nav_map[sv] = nav_ds
+                    found_nav = True
                     break
+            if not found_nav: stats['no_nav'] += 1
 
-    for sv in tqdm(valid_svs, desc="🛰️ Verarbeite GPS & Galileo"):
+    for sv in tqdm(valid_svs, desc="🛰️ Analysiere Satelliten"):
         sv_id = str(sv)
         sv_data = obs.sel(sv=sv)
         nav_sv = nav_map[sv].sel(sv=sv) 
         
-        # --- FIX A: Dynamische & robuste Band-Selektion ---
         best_p1, best_p2 = None, None
         max_valid = 0
         
         for b1 in l1_bands:
             for b2 in l2_bands:
                 if b1 in sv_data.data_vars and b2 in sv_data.data_vars:
-                    # Zählt, wie viele Werte für dieses Bandpaar NICHT NaN sind
                     valid_mask = ~np.isnan(sv_data[b1] - sv_data[b2])
                     valid_count = int(valid_mask.sum().item())
-                    
                     if valid_count > max_valid:
                         max_valid = valid_count
                         best_p1, best_p2 = b1, b2
 
         if max_valid < 5: 
-            continue # Überspringen, wenn der Satellit weniger als 5 nutzbare Epochen hat
+            stats['no_dual_freq'] += 1
+            continue 
             
         p1_var, p2_var = best_p1, best_p2
-        # --------------------------------------------------
             
+        # RAW STEC berechnen
         stec_raw = get_tec_multiplier(sv_id[0]) * (sv_data[p2_var] - sv_data[p1_var])
-        valid_mask = ~np.isnan(stec_raw.values)
-        stec_vals = stec_raw.values[valid_mask]
+        
+        # --- GLÄTTUNG (Noise Filtering) ---
+        # Verhindert die absurden Sprünge (z.B. 140 TECU) durch verrauschte P-Codes
+        stec_smoothed = pd.Series(stec_raw.values).rolling(window=10, center=True, min_periods=1).mean()
+        
+        valid_mask = ~np.isnan(stec_smoothed)
+        stec_vals = stec_smoothed[valid_mask]
         time_vals = stec_raw.time.values[valid_mask]
 
-        track_lats, track_lons, track_vtecs = [], [],[]
+        track_lats, track_lons, track_vtecs =[], [],[]
+        had_low_elevation = False
+        
         for t_obs, stec in zip(time_vals, stec_vals):
             X, Y, Z = get_satellite_position_kepler(nav_sv, t_obs)
             if X is None: continue
             az, el, _ = pm.ecef2aer(X, Y, Z, lat_sta, lon_sta, alt_sta)
             
-            if el > 15.0: # Elevationsmaske
+            # Striktere Elevationsmaske (25 Grad statt 15 Grad)!
+            if el > 25.0: 
                 lat_ipp, lon_ipp = calculate_ipp(lat_sta, lon_sta, az, el)
                 vtec = stec * mapping_function(el)
                 track_lats.append(lat_ipp)
                 track_lons.append(lon_ipp)
                 track_vtecs.append(vtec)
+            else:
+                had_low_elevation = True
                 
         if len(track_vtecs) > 0:
             track_vtecs = np.array(track_vtecs)
-            
-            # --- FIX C: Per-Satellite Leveling (Pseudo-DCB Korrektur) ---
-            # Statt pauschal am Ende alles zu korrigieren, leveln wir JEDEN 
-            # Satelliten einzeln auf einen physikalisch realistischen Minimalwert.
-            # Das verhindert die extremen Sprünge (z.B. 10 TECU vs 60 TECU).
-            track_vtecs = track_vtecs - np.min(track_vtecs) + 5.0 
-            # -------------------------------------------------------------
-            
+            # Relatives Leveling (DCB Simulation), startet realistisch bei 10-15 TECU
+            track_vtecs = track_vtecs - np.min(track_vtecs) + 15.0 
             all_lats.extend(track_lats)
             all_lons.extend(track_lons)
             all_vtecs.extend(track_vtecs)
+            stats['success'] += 1
+        elif had_low_elevation:
+            stats['low_elevation'] += 1
 
-    # --- Zeitfenster für den Plot-Titel extrahieren ---
     time_min = pd.to_datetime(obs.time.values.min())
     time_max = pd.to_datetime(obs.time.values.max())
     time_str = f"{time_min.strftime('%H:%M')} - {time_max.strftime('%H:%M')} UTC"
 
+    print("\n--- 📊 SATELLITEN-DIAGNOSE ---")
+    print(f"Total im OBS-File: {stats['total']}")
+    print(f"Erfolgreich geplottet: {stats['success']}")
+    print(f"Verworfen wegen fehlender Navigationsdaten: {stats['no_nav']}")
+    print(f"Verworfen wegen fehlender/schlechter Zweifrequenz (Multipath?): {stats['no_dual_freq']}")
+    print(f"Verworfen weil zu nah am Horizont (<25° Elevation): {stats['low_elevation']}")
+    print("--------------------------------")
+
     return np.array(all_lats), np.array(all_lons), np.array(all_vtecs), lat_sta, lon_sta, time_str
 
 def plot_professional_ionosphere_map(lats, lons, vtec, lat_sta, lon_sta, time_str):
-    print("\n🌍 Erzeuge VTEC-Karte (RBF Smoothed & Masked)...")
+    print("\n🌍 Erzeuge VTEC-Karte...")
     if len(vtec) == 0:
-        print("❌ ABBRUCH: Keine Daten.")
+        print("❌ ABBRUCH: Keine Daten nach Filterung übrig.")
         return
 
-    grid_lon, grid_lat = np.mgrid[lon_sta-10:lon_sta+10:300j, lat_sta-8:lat_sta+8:300j]
+    grid_lon, grid_lat = np.mgrid[lon_sta-6:lon_sta+6:400j, lat_sta-5:lat_sta+5:400j]
     
-    # RBF Interpolation
     rbf = Rbf(lons, lats, vtec, function='linear', epsilon=2.0)
     grid_vtec = rbf(grid_lon, grid_lat)
 
-    # Masking mit KDTree (Begrenzung des Einflussbereichs)
+    # STRIKTERES MASKING: Verhindert riesige Farbkleckse ohne Datenbasis
     tree = cKDTree(np.c_[lons, lats])
     dist, _ = tree.query(np.c_[grid_lon.ravel(), grid_lat.ravel()])
     dist = dist.reshape(grid_lon.shape)
     
-    MAX_DISTANCE_DEG = 2.5 
+    # Alles was weiter als ca. 110km (1.0 Grad) weg ist, ausblenden!
+    MAX_DISTANCE_DEG = 1.0 
     grid_vtec[dist > MAX_DISTANCE_DEG] = np.nan
 
     grid_vtec_smooth = grid_vtec.copy()
     mask = np.isnan(grid_vtec)
     grid_vtec_smooth[mask] = np.nanmean(grid_vtec) 
-    grid_vtec_smooth = gaussian_filter(grid_vtec_smooth, sigma=1.0)
+    grid_vtec_smooth = gaussian_filter(grid_vtec_smooth, sigma=0.8)
     grid_vtec_smooth[mask] = np.nan 
 
-    fig = plt.figure(figsize=(12, 9))
+    fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.Mercator())
-    ax.set_extent([lon_sta - 8, lon_sta + 8, lat_sta - 6, lat_sta + 6], crs=ccrs.PlateCarree())
+    ax.set_extent([lon_sta - 5, lon_sta + 5, lat_sta - 4, lat_sta + 4], crs=ccrs.PlateCarree())
     
-    ax.add_feature(cfeature.COASTLINE, linewidth=1.2, edgecolor='#333333')
-    ax.add_feature(cfeature.BORDERS, linestyle='--', alpha=0.6)
-    ax.add_feature(cfeature.LAND, facecolor='#f5f5f5')
-    ax.add_feature(cfeature.OCEAN, facecolor='#e0f0ff')
+    ax.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor='#333333')
+    ax.add_feature(cfeature.BORDERS, linestyle='--', alpha=0.5)
+    ax.add_feature(cfeature.LAND, facecolor='#f9f9f9')
+    ax.add_feature(cfeature.OCEAN, facecolor='#e6f2ff')
     
-    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle=':')
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.4, linestyle=':')
     gl.top_labels = False
     gl.right_labels = False
     
-    # Levels dynamisch an echte Daten anpassen (Verhindert zu starke Sättigung)
-    vmax = max(15, np.nanmax(grid_vtec_smooth))
-    levels = np.linspace(0, vmax, 40)
+    # Realistische TEC-Skala erzwingen (verhindert das 140-TECU-Problem visuell)
+    vmin, vmax = np.nanmin(grid_vtec_smooth), np.nanmax(grid_vtec_smooth)
+    levels = np.linspace(vmin, vmax, 30)
     
-    contour = ax.contourf(grid_lon, grid_lat, grid_vtec_smooth, levels=levels, cmap='plasma', alpha=0.85, transform=ccrs.PlateCarree())
+    contour = ax.contourf(grid_lon, grid_lat, grid_vtec_smooth, levels=levels, cmap='jet', alpha=0.75, transform=ccrs.PlateCarree())
     
-    ax.scatter(lons, lats, color='white', s=15, transform=ccrs.PlateCarree(), alpha=0.8)
-    ax.scatter(lons, lats, color='black', s=5, transform=ccrs.PlateCarree(), alpha=1.0, label='IPP Messpunkte')
+    ax.scatter(lons, lats, color='white', s=15, transform=ccrs.PlateCarree(), alpha=0.9)
+    ax.scatter(lons, lats, color='black', s=3, transform=ccrs.PlateCarree(), alpha=1.0, label='IPP Messkorridor')
     ax.plot(lon_sta, lat_sta, marker='^', color='red', markersize=14, markeredgecolor='white', markeredgewidth=1.5, transform=ccrs.PlateCarree(), label="GNSS Station")
     
     cbar = plt.colorbar(contour, ax=ax, shrink=0.75, pad=0.04)
-    cbar.set_label('Relativer VTEC [TECU]', fontsize=13, weight='bold') # Titel leicht angepasst
-    cbar.ax.tick_params(labelsize=11)
+    cbar.set_label('Geglätteter VTEC[TECU]', fontsize=13, weight='bold')
     
-    # Titel um Uhrzeit ergänzt!
-    plt.title(f'Lokale VTEC Ionosphären-Map ({time_str})\nStation: {lon_sta:.2f}E, {lat_sta:.2f}N | Höhe: 350km', pad=15, fontsize=15, weight='bold')
+    plt.title(f'VTEC Messkorridore ({time_str})\nStation: {lon_sta:.2f}E, {lat_sta:.2f}N | Filter: 25° Elev.', pad=15, fontsize=14, weight='bold')
     plt.legend(loc='lower right', framealpha=0.95, fontsize=11)
     plt.tight_layout()
     plt.show()
@@ -240,6 +263,7 @@ def plot_professional_ionosphere_map(lats, lons, vtec, lat_sta, lon_sta, time_st
 if __name__ == '__main__':
     # ====================================================================
     RINEX_OBS_FILE = r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 5\V3RJ1060.26O"
+    # Wenn du BeiDou/GLONASS Navigationsdaten hast, pack sie mit in diese Liste!
     RINEX_NAV_FILES =[r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 5\V3RJ1060.26N", r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 5\V3RJ1060.26L"]  
     # ====================================================================
     
