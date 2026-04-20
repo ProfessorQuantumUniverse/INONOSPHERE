@@ -51,9 +51,20 @@ def get_satellite_position_kepler(nav_sv, t_obs):
     try:
         nav_epoch = nav_sv.sel(time=t_obs, method='nearest')
         t_nav = nav_epoch['time'].values
+        
+        # Zeitunterschied zu groß? Weg damit!
         if abs((t_obs - t_nav) / np.timedelta64(1, 'h')) > 4.0:
             return None, None, None
 
+        # 🚀 NEU: GLONASS RETTUNGS-ANKER 🚀
+        # GLONASS (.26G) nutzt keine Kepler-Kurven, sondern sendet direkte X,Y,Z Koordinaten in Kilometern!
+        if 'X' in nav_epoch.data_vars and 'Y' in nav_epoch.data_vars:
+            X = float(nav_epoch['X'].values) * 1000.0  # Umrechnung in Meter
+            Y = float(nav_epoch['Y'].values) * 1000.0
+            Z = float(nav_epoch['Z'].values) * 1000.0
+            return X, Y, Z
+
+        # Für GPS / Galileo / BeiDou (Klassische Kepler-Berechnung)
         def safe_get(*keys):
             for k in keys:
                 if k in nav_epoch.data_vars or k in nav_epoch.coords:
@@ -94,6 +105,146 @@ def get_satellite_position_kepler(nav_sv, t_obs):
         return X, Y, Z
     except Exception:
         return None, None, None
+
+
+def process_rinex_advanced(obs_file, nav_files, ionex_file):
+    obs = gr.load(obs_file)
+    if isinstance(nav_files, str): nav_files = [nav_files]
+    nav_datasets =[gr.load(f) for f in nav_files]
+    
+    if 'position' not in obs.attrs:
+        lat_sta, lon_sta, alt_sta = 49.87, 8.62, 100.0
+    else:
+        x, y, z = obs.attrs['position']
+        lat_sta, lon_sta, alt_sta = pm.ecef2geodetic(x, y, z)
+
+    time_min = pd.to_datetime(obs.time.values.min())
+    time_max = pd.to_datetime(obs.time.values.max())
+    target_time = time_min + (time_max - time_min) / 2
+    
+    BASE_VTEC_LEVEL = get_absolute_base_vtec(ionex_file, lat_sta, lon_sta, target_time)
+
+    # 🚀 NEU: Viel größeres Fangnetz für alle möglichen Frequenzbänder
+    l1_bands =['C1C', 'C1P', 'C1W', 'C1X', 'C1S', 'C1B', 'C1A', 'C2I']
+    l2_bands =['C2W', 'C2C', 'C2L', 'C2P', 'C2X', 'C5Q', 'C5X', 'C5I', 'C7Q', 'C7X', 'C8Q', 'C8X', 'C7I']
+
+    all_lats, all_lons, all_vtecs =[],[],[]
+    valid_svs =[]
+    nav_map = {} 
+    stats = {'total': 0, 'no_nav': 0, 'no_dual_freq': 0, 'low_elevation': 0, 'orbit_err': 0, 'success': 0}
+    
+    for sv in obs.sv.values:
+        stats['total'] += 1
+        sys_id = str(sv)[0]
+        if sys_id in['G', 'E', 'C', 'R']: 
+            found_nav = False
+            for nav_ds in nav_datasets:
+                if sv in nav_ds.sv.values:
+                    valid_svs.append(sv)
+                    nav_map[sv] = nav_ds
+                    found_nav = True
+                    break
+            if not found_nav: stats['no_nav'] += 1
+
+    for sv in tqdm(valid_svs, desc="🛰️ Analysiere & Filtere Satelliten"):
+        sv_id = str(sv)
+        sv_data = obs.sel(sv=sv)
+        nav_sv = nav_map[sv].sel(sv=sv) 
+        
+        best_p1, best_p2 = None, None
+        max_valid = 0
+        
+        for b1 in l1_bands:
+            for b2 in l2_bands:
+                if b1 in sv_data.data_vars and b2 in sv_data.data_vars:
+                    valid_count = int((~np.isnan(sv_data[b1] - sv_data[b2])).sum().item())
+                    if valid_count > max_valid:
+                        max_valid = valid_count
+                        best_p1, best_p2 = b1, b2
+
+        # 🚀 NEU: Nur noch 5 Epochen nötig (statt 10)
+        if max_valid < 5: 
+            stats['no_dual_freq'] += 1
+            continue 
+            
+        stec_raw = get_tec_multiplier(sv_id[0]) * (sv_data[best_p2] - sv_data[best_p1])
+        valid_mask = np.isfinite(stec_raw.values)
+        
+        stec_vals = stec_raw.values[valid_mask]
+        time_vals = stec_raw.time.values[valid_mask]
+
+        track_lats_raw, track_lons_raw, track_vtecs_raw = [], [],[]
+        had_low_elevation = False
+        kepler_fails = 0
+        
+        for t_obs, stec in zip(time_vals, stec_vals):
+            X, Y, Z = get_satellite_position_kepler(nav_sv, t_obs)
+            if X is None: 
+                kepler_fails += 1
+                continue
+            
+            az, el, _ = pm.ecef2aer(X, Y, Z, lat_sta, lon_sta, alt_sta)
+            
+            # 🚀 NEU: Filter auf 20° gesenkt! Fängt Satelliten am weiten Horizont ab.
+            if el < 20.0:
+                had_low_elevation = True
+            else:
+                lat_ipp, lon_ipp = calculate_ipp(lat_sta, lon_sta, az, el)
+                vtec = stec * mapping_function(el)
+                
+                if np.isfinite(vtec) and np.isfinite(lat_ipp) and np.isfinite(lon_ipp):
+                    track_lats_raw.append(lat_ipp)
+                    track_lons_raw.append(lon_ipp)
+                    track_vtecs_raw.append(vtec)
+                
+        # 🚀 NEU: Nur noch 5 gute Messpunkte nötig (statt 15)
+        if len(track_vtecs_raw) >= 5:
+            s_raw = pd.Series(track_vtecs_raw)
+            # Rolling Window verkleinert, damit kurze Spuren nicht zu NaN werden
+            vtecs_smoothed = s_raw.rolling(window=3, center=True, min_periods=1).mean().values
+            
+            vtecs_leveled = vtecs_smoothed - np.nanmean(vtecs_smoothed) + BASE_VTEC_LEVEL
+            
+            final_mask = (vtecs_leveled > 0) & (vtecs_leveled < 100) & ~np.isnan(vtecs_leveled)
+            
+            if np.sum(final_mask) >= 3:
+                valid_lats = np.array(track_lats_raw)[final_mask]
+                valid_lons = np.array(track_lons_raw)[final_mask]
+                valid_vtecs = vtecs_leveled[final_mask]
+                
+                step = max(1, len(valid_vtecs) // 30)
+                
+                all_lats.extend(valid_lats[::step])
+                all_lons.extend(valid_lons[::step])
+                all_vtecs.extend(valid_vtecs[::step])
+                stats['success'] += 1
+            else:
+                stats['no_dual_freq'] += 1
+        else:
+            if kepler_fails > len(time_vals)/2:
+                stats['orbit_err'] += 1
+            elif had_low_elevation:
+                stats['low_elevation'] += 1
+            else:
+                stats['orbit_err'] += 1
+
+    time_str = f"{time_min.strftime('%H:%M')} - {time_max.strftime('%H:%M')} UTC"
+    
+    # 🚀 NEU: Die Diagnose-Tabelle ist zurück! 
+    print("\n" + "="*35)
+    print(" 📊 SATELLITEN-DIAGNOSE TABELLE")
+    print("="*35)
+    print(f"Total im OBS-File gesichtet:     {stats['total']}")
+    print(f"Erfolgreich für Karte genutzt:   {stats['success']}")
+    print("-" * 35)
+    print("Aussortiert weil:")
+    print(f"- Keine Navigationsdaten (.26N/L/G): {stats['no_nav']}")
+    print(f"- Kein sauberes Dual-Freq Signal:  {stats['no_dual_freq']}")
+    print(f"- Zu nah am Horizont (<20° Elev):  {stats['low_elevation']}")
+    print(f"- Fehler im Kepler-Orbit (Epoche): {stats['orbit_err']}")
+    print("="*35 + "\n")
+
+    return np.array(all_lats), np.array(all_lons), np.array(all_vtecs), lat_sta, lon_sta, time_str
 
 def get_absolute_base_vtec(ionex_file, lat_sta, lon_sta, target_time):
     if not ionex_file or not os.path.exists(ionex_file):
@@ -172,124 +323,6 @@ def get_absolute_base_vtec(ionex_file, lat_sta, lon_sta, target_time):
         
     except Exception:
         return 20.0
-
-def process_rinex_advanced(obs_file, nav_files, ionex_file):
-    obs = gr.load(obs_file)
-    if isinstance(nav_files, str): nav_files = [nav_files]
-    nav_datasets =[gr.load(f) for f in nav_files]
-    
-    if 'position' not in obs.attrs:
-        lat_sta, lon_sta, alt_sta = 49.87, 8.62, 100.0
-    else:
-        x, y, z = obs.attrs['position']
-        lat_sta, lon_sta, alt_sta = pm.ecef2geodetic(x, y, z)
-
-    time_min = pd.to_datetime(obs.time.values.min())
-    time_max = pd.to_datetime(obs.time.values.max())
-    target_time = time_min + (time_max - time_min) / 2
-    
-    BASE_VTEC_LEVEL = get_absolute_base_vtec(ionex_file, lat_sta, lon_sta, target_time)
-
-    # Wir decken nun auch GLONASS Bänder ab!
-    l1_bands =['C1C', 'C1P', 'C1W', 'C1X', 'C1S', 'C2I']
-    l2_bands =['C2W', 'C2C', 'C2L', 'C2P', 'C5Q', 'C5X', 'C7Q', 'C8Q', 'C7I']
-
-    all_lats, all_lons, all_vtecs =[],[],[]
-    valid_svs =[]
-    nav_map = {} 
-    stats = {'total': 0, 'no_nav': 0, 'no_dual_freq': 0, 'low_elevation': 0, 'success': 0}
-    
-    for sv in obs.sv.values:
-        stats['total'] += 1
-        sys_id = str(sv)[0]
-        # GLONASS 'R' hinzugefügt!
-        if sys_id in ['G', 'E', 'C', 'R']: 
-            found_nav = False
-            for nav_ds in nav_datasets:
-                if sv in nav_ds.sv.values:
-                    valid_svs.append(sv)
-                    nav_map[sv] = nav_ds
-                    found_nav = True
-                    break
-            if not found_nav: stats['no_nav'] += 1
-
-    for sv in tqdm(valid_svs, desc="🛰️ Analysiere & Filtere Satelliten"):
-        sv_id = str(sv)
-        sv_data = obs.sel(sv=sv)
-        nav_sv = nav_map[sv].sel(sv=sv) 
-        
-        best_p1, best_p2 = None, None
-        max_valid = 0
-        
-        for b1 in l1_bands:
-            for b2 in l2_bands:
-                if b1 in sv_data.data_vars and b2 in sv_data.data_vars:
-                    valid_count = int((~np.isnan(sv_data[b1] - sv_data[b2])).sum().item())
-                    if valid_count > max_valid:
-                        max_valid = valid_count
-                        best_p1, best_p2 = b1, b2
-
-        if max_valid < 10: 
-            stats['no_dual_freq'] += 1
-            continue 
-            
-        stec_raw = get_tec_multiplier(sv_id[0]) * (sv_data[best_p2] - sv_data[best_p1])
-        valid_mask = np.isfinite(stec_raw.values)
-        
-        stec_vals = stec_raw.values[valid_mask]
-        time_vals = stec_raw.time.values[valid_mask]
-
-        track_lats_raw, track_lons_raw, track_vtecs_raw = [], [],[]
-        had_low_elevation = False
-        
-        for t_obs, stec in zip(time_vals, stec_vals):
-            X, Y, Z = get_satellite_position_kepler(nav_sv, t_obs)
-            if X is None: continue
-            
-            az, el, _ = pm.ecef2aer(X, Y, Z, lat_sta, lon_sta, alt_sta)
-            if el < 25.0:
-                had_low_elevation = True
-            else:
-                lat_ipp, lon_ipp = calculate_ipp(lat_sta, lon_sta, az, el)
-                vtec = stec * mapping_function(el)
-                
-                if np.isfinite(vtec) and np.isfinite(lat_ipp) and np.isfinite(lon_ipp):
-                    track_lats_raw.append(lat_ipp)
-                    track_lons_raw.append(lon_ipp)
-                    track_vtecs_raw.append(vtec)
-                
-        if len(track_vtecs_raw) > 15:
-            # 1. SICHERER FILTER: Rolling Mean statt Polynom! 
-            # Verhindert, dass die Enden der Spuren nach oben/unten explodieren.
-            s_raw = pd.Series(track_vtecs_raw)
-            vtecs_smoothed = s_raw.rolling(window=15, center=True, min_periods=2).mean().values
-            
-            # Leveling (Kalibrierung auf Ionex)
-            vtecs_leveled = vtecs_smoothed - np.nanmean(vtecs_smoothed) + BASE_VTEC_LEVEL
-            
-            final_mask = (vtecs_leveled > 0) & (vtecs_leveled < 100) & ~np.isnan(vtecs_leveled)
-            
-            if np.sum(final_mask) > 10:
-                valid_lats = np.array(track_lats_raw)[final_mask]
-                valid_lons = np.array(track_lons_raw)[final_mask]
-                valid_vtecs = vtecs_leveled[final_mask]
-                
-                # Subsampling (Ausdünnen auf ~30 Ankerpunkte pro Spur)
-                step = max(1, len(valid_vtecs) // 30)
-                
-                all_lats.extend(valid_lats[::step])
-                all_lons.extend(valid_lons[::step])
-                all_vtecs.extend(valid_vtecs[::step])
-                stats['success'] += 1
-            else:
-                stats['no_dual_freq'] += 1
-        elif had_low_elevation:
-            stats['low_elevation'] += 1
-
-    time_str = f"{time_min.strftime('%H:%M')} - {time_max.strftime('%H:%M')} UTC"
-    print(f"\n✅ {stats['success']} Satelliten erfolgreich für Karte verarbeitet!\n")
-
-    return np.array(all_lats), np.array(all_lons), np.array(all_vtecs), lat_sta, lon_sta, time_str
 
 
 def plot_professional_ionosphere_map(lats, lons, vtec, lat_sta, lon_sta, time_str):
@@ -377,14 +410,14 @@ def plot_professional_ionosphere_map(lats, lons, vtec, lat_sta, lon_sta, time_st
 
 if __name__ == '__main__':
     # TRAGE HIER DEINE PFADE EIN:
-    RINEX_OBS_FILE = r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1060.26O"
+    RINEX_OBS_FILE = r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 1\V3RJ1050.26O"
     RINEX_NAV_FILES =[
-        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1060.26N", 
-        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1060.26L",
-        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1061.26P",
-        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1060.26G"
+        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 1\V3RJ1050.26N", 
+        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 1\V3RJ1050.26L",
+        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 1\V3RJ1051.26P",
+        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 1\V3RJ1050.26G"
     ]
-    IONEX_FILE = r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 5\c1pg1060.26i"
+    IONEX_FILE = r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 1\c1pg1050.26i"
     
     lats, lons, vtecs, sta_lat, sta_lon, time_str = process_rinex_advanced(RINEX_OBS_FILE, RINEX_NAV_FILES, IONEX_FILE)
     if len(vtecs) > 0:
