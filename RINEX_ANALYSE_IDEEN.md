@@ -1,13 +1,13 @@
 # RINEX-Analyseideen (zusätzlich zu VTEC)
 
-Ausgangsstruktur deiner Daten:
+Ausgangsstruktur Deiner Daten:
 - `.26O` = Observation (Code/Phase/SNR, Zeitreihe)
 - `.26N` = GPS Navigation
 - `.26L` = Galileo Navigation
 - `.26P` = Mixed Navigation (mehrere GNSS)
 
 Dein aktuelles Repo hat bereits ein VTEC-Skript (`main.py`).  
-Hier sind weitere sinnvolle Auswertungen (inkl. **WIE?**) basierend auf deinen Bild-Ideen + zusätzlichen Vorschlägen:
+Hier sind weitere sinnvolle Auswertungen (inkl. **WIE?**) basierend auf den genannten Themen aus den Bildern (u. a. SPP, PPP, RTK, PVT, Multipath, Genauigkeitsvergleich) plus zusätzlichen Vorschlägen:
 
 ---
 
@@ -188,4 +188,4 @@ Hier sind weitere sinnvolle Auswertungen (inkl. **WIE?**) basierend auf deinen B
 4. **Optional RTK**, wenn Basisdaten/NTRIP vorliegen  
 5. **Erweiterung auf PVT/ROTI/Dashboard**
 
-Damit bekommst du von „nur VTEC“ zu einer vollständigen GNSS-Qualitäts- und Genauigkeitsanalyse.
+Damit bekommst Du von „nur VTEC“ zu einer vollständigen GNSS-Qualitäts- und Genauigkeitsanalyse.
