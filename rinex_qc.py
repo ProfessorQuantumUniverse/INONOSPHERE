@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-from scipy.spatial.distance import cdist  # NEU: Für den Gauß-Filter
+from scipy.spatial import cKDTree
 import pymap3d as pm
 from tqdm import tqdm
 import warnings
@@ -22,7 +22,6 @@ def get_tec_multiplier(sys_id):
     if sys_id == 'G': return 9.52
     elif sys_id == 'E': return 7.76
     elif sys_id == 'C': return 8.99 
-    elif sys_id == 'R': return 9.52 # GLONASS Näherung
     return 9.52
 
 def mapping_function(elevation_deg):
@@ -165,6 +164,9 @@ def get_absolute_base_vtec(ionex_file, lat_sta, lon_sta, target_time):
         
         print("\n" + "🌟"*22)
         print(" 🌍 IONEX KALIBRIERUNG ERFOLGREICH!")
+        print("🌟"*22)
+        print(f"Gewählte Karte: {best_epoch.strftime('%H:%M')} UTC")
+        print(f"Gitter-Punkt:   {closest_lat}°N, {closest_lon}°E")
         print(f"Anker-TEC Wert: {actual_tec:.1f} TECU")
         print("🌟"*22 + "\n")
         
@@ -190,20 +192,19 @@ def process_rinex_advanced(obs_file, nav_files, ionex_file):
     
     BASE_VTEC_LEVEL = get_absolute_base_vtec(ionex_file, lat_sta, lon_sta, target_time)
 
-    # Wir decken nun auch GLONASS Bänder ab!
     l1_bands =['C1C', 'C1P', 'C1W', 'C1X', 'C1S', 'C2I']
-    l2_bands =['C2W', 'C2C', 'C2L', 'C2P', 'C5Q', 'C5X', 'C7Q', 'C8Q', 'C7I']
+    l2_bands =['C2W', 'C2C', 'C2L', 'C5Q', 'C5X', 'C7Q', 'C8Q', 'C7I']
 
-    all_lats, all_lons, all_vtecs =[],[],[]
+    all_lats, all_lons, all_vtecs = [],[],[]
     valid_svs =[]
     nav_map = {} 
-    stats = {'total': 0, 'no_nav': 0, 'no_dual_freq': 0, 'low_elevation': 0, 'success': 0}
+    
+    stats = {'total': 0, 'no_nav': 0, 'no_dual_freq': 0, 'low_elevation': 0, 'orbit_err': 0, 'success': 0}
     
     for sv in obs.sv.values:
         stats['total'] += 1
         sys_id = str(sv)[0]
-        # GLONASS 'R' hinzugefügt!
-        if sys_id in ['G', 'E', 'C', 'R']: 
+        if sys_id in ['G', 'E', 'C']: 
             found_nav = False
             for nav_ds in nav_datasets:
                 if sv in nav_ds.sv.values:
@@ -229,7 +230,7 @@ def process_rinex_advanced(obs_file, nav_files, ionex_file):
                         max_valid = valid_count
                         best_p1, best_p2 = b1, b2
 
-        if max_valid < 10: 
+        if max_valid < 5: 
             stats['no_dual_freq'] += 1
             continue 
             
@@ -241,10 +242,13 @@ def process_rinex_advanced(obs_file, nav_files, ionex_file):
 
         track_lats_raw, track_lons_raw, track_vtecs_raw = [], [],[]
         had_low_elevation = False
+        kepler_fails = 0
         
         for t_obs, stec in zip(time_vals, stec_vals):
             X, Y, Z = get_satellite_position_kepler(nav_sv, t_obs)
-            if X is None: continue
+            if X is None: 
+                kepler_fails += 1
+                continue
             
             az, el, _ = pm.ecef2aer(X, Y, Z, lat_sta, lon_sta, alt_sta)
             if el < 25.0:
@@ -258,42 +262,54 @@ def process_rinex_advanced(obs_file, nav_files, ionex_file):
                     track_lons_raw.append(lon_ipp)
                     track_vtecs_raw.append(vtec)
                 
-        if len(track_vtecs_raw) > 15:
-            # 1. SICHERER FILTER: Rolling Mean statt Polynom! 
-            # Verhindert, dass die Enden der Spuren nach oben/unten explodieren.
-            s_raw = pd.Series(track_vtecs_raw)
-            vtecs_smoothed = s_raw.rolling(window=15, center=True, min_periods=2).mean().values
+        if len(track_vtecs_raw) > 10:
+            # ROHE Daten filtern wir NICHT mehr vorab, da der Hardware-DCB-Bias 
+            # den Rohen-VTEC Wert leicht auf -50 bis -100 drücken kann!
             
-            # Leveling (Kalibrierung auf Ionex)
+            vtecs_smoothed = pd.Series(track_vtecs_raw).rolling(window=15, center=True, min_periods=1).mean().values
+            
+            # MAGIE: Hier wird der gigantische Hardware-Bias abgezogen und die 
+            # Kurve "rastet" weich auf dem absoluten IONEX-Niveau ein!
             vtecs_leveled = vtecs_smoothed - np.nanmean(vtecs_smoothed) + BASE_VTEC_LEVEL
             
+            # Erst JETZT schmeißen wir physikalische Nonsens-Werte raus
             final_mask = (vtecs_leveled > 0) & (vtecs_leveled < 100) & ~np.isnan(vtecs_leveled)
             
             if np.sum(final_mask) > 10:
-                valid_lats = np.array(track_lats_raw)[final_mask]
-                valid_lons = np.array(track_lons_raw)[final_mask]
-                valid_vtecs = vtecs_leveled[final_mask]
-                
-                # Subsampling (Ausdünnen auf ~30 Ankerpunkte pro Spur)
-                step = max(1, len(valid_vtecs) // 30)
-                
-                all_lats.extend(valid_lats[::step])
-                all_lons.extend(valid_lons[::step])
-                all_vtecs.extend(valid_vtecs[::step])
+                all_lats.extend(np.array(track_lats_raw)[final_mask])
+                all_lons.extend(np.array(track_lons_raw)[final_mask])
+                all_vtecs.extend(vtecs_leveled[final_mask])
                 stats['success'] += 1
             else:
                 stats['no_dual_freq'] += 1
-        elif had_low_elevation:
-            stats['low_elevation'] += 1
+        else:
+            # Festhalten WARUM der Satellit verworfen wurde
+            if kepler_fails > len(time_vals)/2:
+                stats['orbit_err'] += 1
+            elif had_low_elevation:
+                stats['low_elevation'] += 1
+            else:
+                stats['orbit_err'] += 1
 
     time_str = f"{time_min.strftime('%H:%M')} - {time_max.strftime('%H:%M')} UTC"
-    print(f"\n✅ {stats['success']} Satelliten erfolgreich für Karte verarbeitet!\n")
+
+    print("\n" + "="*35)
+    print(" 📊 SATELLITEN-DIAGNOSE TABELLE")
+    print("="*35)
+    print(f"Total im OBS-File gesichtet:     {stats['total']}")
+    print(f"Erfolgreich geplottet:           {stats['success']}")
+    print("-" * 35)
+    print("Aussortiert weil:")
+    print(f"- Keine Navigationsdaten (.26N/L): {stats['no_nav']}")
+    print(f"- L2 Multipath / Signalverlust:  {stats['no_dual_freq']}")
+    print(f"- Zu nah am Horizont (<25° Elev): {stats['low_elevation']}")
+    print(f"- Fehler im Kepler-Orbit (Epoche):{stats['orbit_err']}")
+    print("="*35 + "\n")
 
     return np.array(all_lats), np.array(all_lons), np.array(all_vtecs), lat_sta, lon_sta, time_str
 
-
 def plot_professional_ionosphere_map(lats, lons, vtec, lat_sta, lon_sta, time_str):
-    print("🌍 Erzeuge physikalische VTEC-Wärmekarte (Gaussian Kernel Filtering)...")
+    print("🌍 Erzeuge weiche VTEC-Karte (IDW Interpolation)...")
     
     valid = np.isfinite(lons) & np.isfinite(lats) & np.isfinite(vtec)
     lons = lons[valid]
@@ -301,37 +317,30 @@ def plot_professional_ionosphere_map(lats, lons, vtec, lat_sta, lon_sta, time_st
     vtec = vtec[valid]
     
     if len(vtec) < 3:
-        print("❌ ABBRUCH: Zu wenige Messpunkte.")
+        print("❌ ABBRUCH: Zu wenige gültige Messpunkte für ein 2D-Flächenmodell.")
         return
 
-    # Erzeuge ein dichtes Gitter für die Karte
+    # NEU: Inverse Distance Weighting (IDW) 
+    # Verhindert, dass die Karte außerhalb der Messdaten eskaliert!
     grid_lon, grid_lat = np.mgrid[lon_sta-6:lon_sta+6:400j, lat_sta-5:lat_sta+5:400j]
     grid_points = np.c_[grid_lon.ravel(), grid_lat.ravel()]
     obs_points = np.c_[lons, lats]
 
-    # --- DIE MAGIE: GAUSSSCHES WEICHZEICHNEN ---
-    # Berechnet die Distanz von JEDEM Gitterpunkt zu JEDEM Messpunkt
-    dist_matrix = cdist(grid_points, obs_points)
+    tree = cKDTree(obs_points)
+    # Nutzt die 15 nächsten Nachbarn für einen extrem weichen, natürlichen Verlauf
+    dist, idx = tree.query(grid_points, k=15)
     
-    # SIGMA: Kontrolliert, wie "flüssig" die Karte ineinanderläuft. 
-    # 1.2 Grad (ca. 130 km) erzeugt extrem weiche, realistische Gradienten!
-    sigma = 1.2 
+    # Vermeide Division durch Null, falls ein Punkt exakt getroffen wird
+    dist = np.maximum(dist, 1e-6)
+    weights = 1.0 / (dist ** 2)
     
-    # Berechne die Gewichte (Glockenkurve: nah = 1, fern = nähert sich 0)
-    weights = np.exp(-(dist_matrix**2) / (2 * sigma**2))
-    sum_weights = np.sum(weights, axis=1)
-    
-    # Division durch Null vermeiden
-    sum_weights[sum_weights == 0] = 1e-10 
-    
-    # Berechne den gewichteten TEC-Wert für das gesamte Gitter
-    grid_vtec_flat = np.sum(weights * vtec, axis=1) / sum_weights
-    grid_vtec = grid_vtec_flat.reshape(grid_lon.shape)
+    vtec_values = vtec[idx]
+    idw_vtec = np.sum(weights * vtec_values, axis=1) / np.sum(weights, axis=1)
+    grid_vtec = idw_vtec.reshape(grid_lon.shape)
 
-    # Entferne Farbenbereiche, die zu weit (> 2.5 Grad) von echten Messungen entfernt sind
-    dist_min = np.min(dist_matrix, axis=1)
-    grid_vtec[dist_min.reshape(grid_lon.shape) > 2.5] = np.nan
-    # ------------------------------------------
+    # Verstecke Grid-Punkte, die zu weit von jeglicher Satellitenspur entfernt sind
+    dist_min, _ = tree.query(grid_points, k=1)
+    grid_vtec[dist_min.reshape(grid_lon.shape) > 2.0] = np.nan
 
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.Mercator())
@@ -348,41 +357,33 @@ def plot_professional_ionosphere_map(lats, lons, vtec, lat_sta, lon_sta, time_st
     
     vmin = np.nanmin(grid_vtec)
     vmax = np.nanmax(grid_vtec)
-    
-    # Fallback, falls die TEC-Schwankungen an diesem Tag minimal waren
-    if (vmax - vmin) < 2.0:
-        center = (vmax + vmin) / 2.0
-        vmin, vmax = center - 1.0, center + 1.0
+    if np.isnan(vmin) or np.isnan(vmax) or vmin == vmax: 
+        vmax = vmin + 1.0 
         
     levels = np.linspace(vmin, vmax, 60) 
     
-    # Plotte die fließende Heatmap
     contour = ax.contourf(grid_lon, grid_lat, grid_vtec, levels=levels, cmap='plasma', alpha=0.85, transform=ccrs.PlateCarree())
-    ax.contour(grid_lon, grid_lat, grid_vtec, levels=15, colors='white', alpha=0.3, linewidths=0.5, transform=ccrs.PlateCarree())
+    ax.contour(grid_lon, grid_lat, grid_vtec, levels=10, colors='white', alpha=0.3, linewidths=0.5, transform=ccrs.PlateCarree())
     
-    # Plotte die Messpunkte
-    ax.scatter(lons, lats, color='white', s=20, transform=ccrs.PlateCarree(), alpha=0.9)
-    ax.scatter(lons, lats, color='black', s=5, transform=ccrs.PlateCarree(), alpha=1.0, label='IPP Ankerpunkte')
+    ax.scatter(lons, lats, color='white', s=15, transform=ccrs.PlateCarree(), alpha=0.9)
+    ax.scatter(lons, lats, color='black', s=3, transform=ccrs.PlateCarree(), alpha=1.0, label='IPP Messkorridor')
     ax.plot(lon_sta, lat_sta, marker='^', color='red', markersize=14, markeredgecolor='white', markeredgewidth=1.5, transform=ccrs.PlateCarree(), label="GNSS Station")
     
     cbar = plt.colorbar(contour, ax=ax, shrink=0.75, pad=0.04)
     cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
     cbar.set_label('Kalibrierter VTEC [TECU]', fontsize=13, weight='bold')
     
-    plt.title(f'Lokales Ionosphärenmodell (LIM) ({time_str})\nAbsolut kalibriert (IONEX) | Gauß-Glättung', pad=15, fontsize=14, weight='bold')
+    plt.title(f'Lokales Ionosphärenmodell (LIM) ({time_str})\nAbsolut kalibriert (IONEX) | Filter: 25° Elev.', pad=15, fontsize=14, weight='bold')
     plt.legend(loc='lower right', framealpha=0.95, fontsize=11)
     plt.tight_layout()
     plt.show()
 
-
 if __name__ == '__main__':
-    # TRAGE HIER DEINE PFADE EIN:
-    RINEX_OBS_FILE = r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1060.26O"
+    # HIER LOG 5 DATEIPFADE EINTRAGEN:
+    RINEX_OBS_FILE = r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 5\V3RJ1060.26O" # Passe auf Log 5 an!
     RINEX_NAV_FILES =[
-        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1060.26N", 
-        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1060.26L",
-        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1061.26P",
-        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 3\V3RJ1060.26G"
+        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 5\V3RJ1060.26N", 
+        r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 5\V3RJ1060.26L"
     ]
     IONEX_FILE = r"C:\Users\loren\OneDrive\Documenten\GNSS\LOG 5\c1pg1060.26i"
     
